@@ -52,6 +52,8 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_160))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_sliding_stride = int(os.environ.get("VAL_SLIDING_STRIDE", 512))
+    val_sliding_batch = int(os.environ.get("VAL_SLIDING_BATCH", 8))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -319,6 +321,86 @@ def eval_val(
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_sliding(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    seq_len = args.train_seq_len
+    stride = args.val_sliding_stride
+    batch_seqs = args.val_sliding_batch
+    total_tokens = val_tokens.numel() - 1
+
+    window_starts = [
+        ws for ws in range(0, total_tokens, stride)
+        if min(ws + seq_len, total_tokens) - ws >= seq_len
+    ]
+    total_windows = len(window_starts)
+    my_s = (total_windows * rank) // world_size
+    my_e = (total_windows * (rank + 1)) // world_size
+    my_windows = window_starts[my_s:my_e]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    base_model.eval()
+    with torch.inference_mode():
+        for bi in range(0, len(my_windows), batch_seqs):
+            batch_ws = my_windows[bi : bi + batch_seqs]
+            bsz = len(batch_ws)
+            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            for i, ws in enumerate(batch_ws):
+                chunk = val_tokens[ws : ws + seq_len + 1].to(
+                    dtype=torch.int64, device=device
+                )
+                x_batch[i] = chunk[:-1]
+                y_batch[i] = chunk[1:]
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = base_model.forward_logits(x_batch, y_batch)
+
+            # logits[:, 0] predicts full[0] = x[0] (skip it)
+            # logits[:, k] predicts full[k] = y[k-1] for k >= 1
+            nll = F.cross_entropy(
+                logits[:, 1:].reshape(-1, logits.size(-1)).float(),
+                y_batch.reshape(-1),
+                reduction="none",
+            ).reshape(bsz, seq_len)
+
+            for i, ws in enumerate(batch_ws):
+                score_start = 0 if ws == 0 else seq_len - stride
+                scored = nll[i, score_start:seq_len].to(torch.float64)
+                loss_sum += scored.sum()
+                n = seq_len - score_start
+                token_count += float(n)
+                tgt = y_batch[i, score_start:seq_len]
+                prev = x_batch[i, score_start:seq_len]
+                tb = base_bytes_lut[tgt].to(torch.float64)
+                tb += (
+                    has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]
+                ).to(torch.float64)
+                byte_count += tb.sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = loss_sum / token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    base_model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
@@ -983,6 +1065,22 @@ class BytePatchJEPA(nn.Module):
         )
         return total, nll
 
+    def forward_logits(
+        self, input_ids: Tensor, target_ids: Tensor
+    ) -> Tensor:
+        full = self._build_full_sequence(input_ids, target_ids)
+        patches = self._patchify(full)
+        patch_emb = self._encode_patches(patches)
+        context = self._contextualize(patch_emb)
+        pred_latent = self.predictor(context[:, :-1])
+        start = self.start_latent.to(dtype=pred_latent.dtype)[None, None, :].expand(
+            patches.size(0), 1, -1
+        )
+        cond_latent = torch.cat((start, pred_latent), dim=1)
+        logits = self._decode_logits(cond_latent, patches)
+        bsz = logits.size(0)
+        return logits.reshape(bsz, -1, self.vocab_size)
+
 
 # -----------------------------
 # TRAINING
@@ -1460,13 +1558,12 @@ def main() -> None:
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
+    q_val_loss, q_val_bpb = eval_val_sliding(
         args,
-        model,
+        base_model,
         rank,
         world_size,
         device,
-        grad_accum_steps,
         val_tokens,
         base_bytes_lut,
         has_leading_space_lut,
