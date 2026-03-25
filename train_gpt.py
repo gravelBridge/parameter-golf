@@ -80,8 +80,8 @@ class Hyperparameters:
     sigreg_weight = float(os.environ.get("SIGREG_WEIGHT", 0.02))
     sigreg_knots = int(os.environ.get("SIGREG_KNOTS", 17))
     sigreg_num_proj = int(os.environ.get("SIGREG_NUM_PROJ", 256))
-    jepa_pred_weight = float(os.environ.get("JEPA_PRED_WEIGHT", 2.0))
-    jepa_ce_weight = float(os.environ.get("JEPA_CE_WEIGHT", 1.0))
+    jepa_pred_weight = float(os.environ.get("JEPA_PRED_WEIGHT", 0.5))
+    jepa_ce_weight = float(os.environ.get("JEPA_CE_WEIGHT", 3.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.1))
