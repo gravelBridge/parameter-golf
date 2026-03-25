@@ -862,9 +862,6 @@ class BytePatchJEPA(nn.Module):
 
         self.start_latent = nn.Parameter(torch.zeros(latent_dim, dtype=torch.float32))
         self.decoder_token_emb = nn.Embedding(vocab_size, model_dim)
-        self.decoder_pos = nn.Parameter(
-            torch.zeros(patch_size, model_dim, dtype=torch.float32)
-        )
         self.decoder_cond = CastedLinear(latent_dim, model_dim, bias=False)
         self.decoder_blocks = nn.ModuleList(
             [
@@ -887,7 +884,6 @@ class BytePatchJEPA(nn.Module):
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.decoder_token_emb.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.patch_pos, mean=0.0, std=0.02)
-        nn.init.normal_(self.decoder_pos, mean=0.0, std=0.02)
         nn.init.normal_(self.start_latent, mean=0.0, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
@@ -931,14 +927,15 @@ class BytePatchJEPA(nn.Module):
         return self.final_norm(x)
 
     def _decode_logits(self, cond_latent: Tensor, target_patches: Tensor) -> Tensor:
-        prev = torch.empty_like(target_patches)
-        prev[..., 0] = self.bos_id
-        prev[..., 1:] = target_patches[..., :-1]
+        bsz, num_patches, patch_size = target_patches.shape
+        total_bytes = num_patches * patch_size
+        flat_bytes = target_patches.reshape(bsz, total_bytes)
+        prev = torch.cat(
+            [flat_bytes.new_full((bsz, 1), self.bos_id), flat_bytes[:, :-1]], dim=1
+        )
         x = self.decoder_token_emb(prev)
-        x = x + self.decoder_pos.to(dtype=x.dtype)[None, None, :, :]
-        x = x + self.decoder_cond(cond_latent).to(dtype=x.dtype)[:, :, None, :]
-        bsz, num_patches, patch_size, dim = x.shape
-        x = x.reshape(bsz * num_patches, patch_size, dim)
+        cond = self.decoder_cond(cond_latent).to(dtype=x.dtype)
+        x = x + cond.repeat_interleave(patch_size, dim=1)
         x0 = x
         for block in self.decoder_blocks:
             x = block(x, x0)
@@ -1129,7 +1126,7 @@ def main() -> None:
         else compiled_model
     )
 
-    embedding_tags = ("tok_emb", "decoder_token_emb", "patch_pos", "decoder_pos")
+    embedding_tags = ("tok_emb", "decoder_token_emb", "patch_pos")
     head_names = {"decoder_out.weight"}
     embedding_params: list[Tensor] = []
     head_params: list[Tensor] = []
