@@ -52,8 +52,18 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_160))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
-    val_sliding_stride = int(os.environ.get("VAL_SLIDING_STRIDE", 512))
+    val_sliding_stride = int(os.environ.get("VAL_SLIDING_STRIDE", 64))
     val_sliding_batch = int(os.environ.get("VAL_SLIDING_BATCH", 8))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+    swa_every = int(os.environ.get("SWA_EVERY", 50))
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
+    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
+    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 8))
+    ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -402,6 +412,164 @@ def eval_val_sliding(
     tokens_per_byte = token_count.item() / byte_count.item()
     base_model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_sliding_ttt(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    log_fn=print,
+) -> tuple[float, float]:
+    seq_len = args.train_seq_len
+    stride = args.val_sliding_stride
+    batch_seqs = args.ttt_batch_seqs
+    total_tokens = val_tokens.numel() - 1
+    ttt_chunk = args.ttt_chunk_tokens
+
+    window_starts = [
+        ws for ws in range(0, total_tokens, stride)
+        if min(ws + seq_len, total_tokens) - ws >= seq_len
+    ]
+    num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
+    chunk_windows: list[list[int]] = [[] for _ in range(num_chunks)]
+    for ws in window_starts:
+        end = min(ws + seq_len, total_tokens)
+        wlen = end - ws
+        s = 0 if ws == 0 else max(wlen - stride, 0)
+        scored_start = ws + s
+        ci = min(scored_start // ttt_chunk, num_chunks - 1)
+        chunk_windows[ci].append(ws)
+
+    log_fn(
+        f"ttt:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
+        f"windows={len(window_starts)} stride={stride} "
+        f"lr={args.ttt_lr} epochs={args.ttt_epochs} freeze={args.ttt_freeze_blocks}"
+    )
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
+    ttt_params = []
+    for name, p in base_model.named_parameters():
+        freeze = any(f"blocks.{bi}." in name for bi in frozen_block_ids)
+        if freeze:
+            p.requires_grad_(False)
+        else:
+            p.requires_grad_(True)
+            ttt_params.append(p)
+
+    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    t0 = time.perf_counter()
+
+    for ci in range(num_chunks):
+        windows = chunk_windows[ci]
+        if not windows:
+            continue
+
+        my_s = (len(windows) * rank) // world_size
+        my_e = (len(windows) * (rank + 1)) // world_size
+        my_windows = windows[my_s:my_e]
+
+        base_model.eval()
+        with torch.inference_mode():
+            for bi in range(0, len(my_windows), batch_seqs):
+                batch_ws = my_windows[bi : bi + batch_seqs]
+                bsz = len(batch_ws)
+                x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                for i, ws in enumerate(batch_ws):
+                    chunk_tok = val_tokens[ws : ws + seq_len + 1].to(
+                        dtype=torch.int64, device=device
+                    )
+                    x_batch[i] = chunk_tok[:-1]
+                    y_batch[i] = chunk_tok[1:]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = base_model.forward_logits(x_batch, y_batch)
+                nll = F.cross_entropy(
+                    logits[:, 1:].reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1),
+                    reduction="none",
+                ).reshape(bsz, seq_len)
+                for i, ws in enumerate(batch_ws):
+                    s = 0 if ws == 0 else seq_len - stride
+                    scored = nll[i, s:seq_len].to(torch.float64)
+                    loss_sum += scored.sum()
+                    token_count += float(seq_len - s)
+                    tgt = y_batch[i, s:seq_len]
+                    prev = x_batch[i, s:seq_len]
+                    tb = base_bytes_lut[tgt].to(torch.float64)
+                    tb += (
+                        has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]
+                    ).to(torch.float64)
+                    byte_count += tb.sum()
+
+        is_last_chunk = ci == num_chunks - 1
+        if not is_last_chunk and args.ttt_epochs > 0:
+            base_model.train()
+            chunk_start = ci * ttt_chunk
+            chunk_end = min((ci + 1) * ttt_chunk, total_tokens)
+            chunk_seqs = (chunk_end - chunk_start) // seq_len
+            if chunk_seqs > 0:
+                cos_lr = args.ttt_lr * 0.5 * (
+                    1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1))
+                )
+                for pg in optimizer.param_groups:
+                    pg["lr"] = cos_lr
+                my_seq_s = (chunk_seqs * rank) // world_size
+                my_seq_e = (chunk_seqs * (rank + 1)) // world_size
+                for _ep in range(args.ttt_epochs):
+                    for bs in range(my_seq_s, my_seq_e, args.ttt_batch_seqs):
+                        be = min(bs + args.ttt_batch_seqs, my_seq_e)
+                        start_tok = chunk_start + bs * seq_len
+                        end_tok = chunk_start + be * seq_len + 1
+                        if end_tok > val_tokens.numel():
+                            continue
+                        local = val_tokens[start_tok:end_tok].to(
+                            device=device, dtype=torch.int64
+                        )
+                        x = local[:-1].reshape(-1, seq_len)
+                        y = local[1:].reshape(-1, seq_len)
+                        optimizer.zero_grad(set_to_none=True)
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            total_loss, _ = base_model(x, y)
+                        total_loss.backward()
+                        if world_size > 1:
+                            for p in ttt_params:
+                                if p.grad is not None:
+                                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                        torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
+                        optimizer.step()
+
+        if rank == 0 and (ci % 50 == 0 or ci == num_chunks - 1):
+            elapsed = time.perf_counter() - t0
+            rl = loss_sum.item() / max(token_count.item(), 1)
+            rbpb = (
+                rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1))
+                if token_count.item() > 0
+                else 0.0
+            )
+            log_fn(f"  ttt_chunk [{ci + 1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s")
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (loss_sum / token_count).item()
+    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
+
+    for p in base_model.parameters():
+        p.requires_grad_(True)
+    base_model.eval()
+    return val_loss, val_bpb
 
 
 # -----------------------------
@@ -802,7 +970,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 
 
@@ -1399,6 +1567,13 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
+    ema_state = {
+        name: t.detach().float().clone()
+        for name, t in base_model.state_dict().items()
+    }
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
+
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1484,6 +1659,23 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        with torch.no_grad():
+            for name, t in base_model.state_dict().items():
+                ema_state[name].mul_(args.ema_decay).add_(
+                    t.detach().float(), alpha=1.0 - args.ema_decay
+                )
+            if scale < 0.2 and (step + 1) % args.swa_every == 0:
+                if swa_state is None:
+                    swa_state = {
+                        name: t.detach().float().clone()
+                        for name, t in base_model.state_dict().items()
+                    }
+                    swa_count = 1
+                else:
+                    for name, t in base_model.state_dict().items():
+                        swa_state[name] += t.detach().float()
+                    swa_count += 1
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = args.train_log_every > 0 and (
@@ -1513,6 +1705,15 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    current_sd = base_model.state_dict()
+    ema_avg = {
+        name: t.to(dtype=current_sd[name].dtype) for name, t in ema_state.items()
+    }
+    base_model.load_state_dict(ema_avg, strict=True)
+    log0(f"ema:applied EMA weights (decay={args.ema_decay})")
+    if swa_state is not None and swa_count > 0:
+        log0(f"swa:collected {swa_count} snapshots (not applied, using EMA)")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1577,6 +1778,29 @@ def main() -> None:
     log0(
         f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}"
     )
+
+    if args.ttt_enabled:
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        ttt_loss, ttt_bpb = eval_val_sliding_ttt(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log_fn=log0,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
+        )
+        log0(f"final_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
