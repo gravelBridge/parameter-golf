@@ -539,8 +539,12 @@ def eval_val_sliding_ttt(
                         y = local[1:].reshape(-1, seq_len)
                         optimizer.zero_grad(set_to_none=True)
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            total_loss, _ = base_model(x, y)
-                        total_loss.backward()
+                            logits = base_model.forward_logits(x, y)
+                        ce = F.cross_entropy(
+                            logits[:, 1:].reshape(-1, logits.size(-1)).float(),
+                            y.reshape(-1),
+                        )
+                        ce.backward()
                         if world_size > 1:
                             for p in ttt_params:
                                 if p.grad is not None:
@@ -1707,13 +1711,19 @@ def main() -> None:
     )
 
     current_sd = base_model.state_dict()
-    ema_avg = {
-        name: t.to(dtype=current_sd[name].dtype) for name, t in ema_state.items()
-    }
-    base_model.load_state_dict(ema_avg, strict=True)
-    log0(f"ema:applied EMA weights (decay={args.ema_decay})")
-    if swa_state is not None and swa_count > 0:
-        log0(f"swa:collected {swa_count} snapshots (not applied, using EMA)")
+    if swa_state is not None and swa_count > 1:
+        swa_avg = {
+            name: (t / swa_count).to(dtype=current_sd[name].dtype)
+            for name, t in swa_state.items()
+        }
+        base_model.load_state_dict(swa_avg, strict=True)
+        log0(f"swa:applied SWA weights ({swa_count} snapshots, every {args.swa_every} steps)")
+    else:
+        ema_avg = {
+            name: t.to(dtype=current_sd[name].dtype) for name, t in ema_state.items()
+        }
+        base_model.load_state_dict(ema_avg, strict=True)
+        log0(f"ema:applied EMA weights (decay={args.ema_decay})")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
