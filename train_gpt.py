@@ -944,6 +944,47 @@ class Block(nn.Module):
         return x
 
 
+class AdaLNBlock(nn.Module):
+    """Transformer block with AdaLN-zero conditioning (DiT/LeWM-style)."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        rope_base: float,
+        qk_gain_init: float,
+        cond_dim: int,
+    ):
+        super().__init__()
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
+        self.attn = CausalSelfAttention(
+            dim, num_heads, num_kv_heads, rope_base, qk_gain_init
+        )
+        self.mlp = MLP(dim, mlp_mult)
+        self.resid_mix = nn.Parameter(
+            torch.stack((torch.ones(dim), torch.zeros(dim))).float()
+        )
+        self.adaln = nn.Sequential(
+            nn.SiLU(),
+            CastedLinear(cond_dim, 6 * dim, bias=True),
+        )
+        nn.init.zeros_(self.adaln[-1].weight)
+        nn.init.zeros_(self.adaln[-1].bias)
+
+    def forward(self, x: Tensor, x0: Tensor, c: Tensor) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = self.adaln(c).chunk(
+            6, dim=-1
+        )
+        x = x + gate_a * self.attn(self.attn_norm(x) * (1 + scale_a) + shift_a)
+        x = x + gate_m * self.mlp(self.mlp_norm(x) * (1 + scale_m) + shift_m)
+        return x
+
+
 class SIGReg(nn.Module):
     # Sketch regularizer from LeWM, adapted to local (per-rank) batches.
     def __init__(self, knots: int = 17, num_proj: int = 256):
@@ -1054,13 +1095,14 @@ class BytePatchJEPA(nn.Module):
         self.decoder_cond = CastedLinear(latent_dim, model_dim, bias=False)
         self.decoder_blocks = nn.ModuleList(
             [
-                Block(
+                AdaLNBlock(
                     model_dim,
                     decoder_heads,
                     decoder_heads,
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    cond_dim=model_dim,
                 )
                 for _ in range(decoder_layers)
             ]
@@ -1125,10 +1167,10 @@ class BytePatchJEPA(nn.Module):
         )
         x = self.decoder_token_emb(prev)
         cond = self.decoder_cond(cond_latent).to(dtype=x.dtype)
-        x = x + cond.repeat_interleave(patch_size, dim=1)
+        cond = cond.repeat_interleave(patch_size, dim=1)
         x0 = x
         for block in self.decoder_blocks:
-            x = block(x, x0)
+            x = block(x, x0, cond)
         x = self.decoder_norm(x)
         return self.decoder_out(x).reshape(
             bsz, num_patches, patch_size, self.vocab_size
